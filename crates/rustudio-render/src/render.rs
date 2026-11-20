@@ -622,7 +622,8 @@ mod gpu_tests {
     }
 
     /// A mesh over max_buffer_size uploads empty instead of panicking in
-    /// wgpu (a 3.2M-triangle mesh against 256 MiB, crash report 2026-11-21).
+    /// wgpu (a 3.2M-triangle mesh against 256 MiB, issue #28); one whose
+    /// corners are over it but whose indexed form fits is still drawn.
     #[test]
     fn oversized_mesh_uploads_empty() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -640,8 +641,43 @@ mod gpu_tests {
             .collect();
         let big = Mesh::upload(&device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX, None);
         let small = Mesh::upload(&device, "loaded mesh", &verts[..96], wgpu::BufferUsages::VERTEX, None);
+        // One triangle 1200 times: 76,800 bytes of corners, 3 vertices indexed.
+        let repeated: Vec<Vertex> = verts[..3].iter().cycle().take(1200).copied().collect();
+        let shared = Mesh::upload(&device, "loaded mesh", &repeated, wgpu::BufferUsages::VERTEX, None);
         assert!(pollster::block_on(scope.pop()).is_none());
         assert_eq!((big.count, small.count), (0, 96));
+        assert_eq!(shared.count, 1200);
+        assert!(shared.ibuf.is_some());
+    }
+
+    /// A CPU-skinned mesh too big for the GPU keeps its one empty slot
+    /// through set_mesh each frame instead of adding a mesh per frame.
+    #[test]
+    fn oversized_skinned_mesh_keeps_its_slot() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter: oversized_skinned_mesh_keeps_its_slot skipped");
+            return;
+        };
+        let max = 16u64 << 20;
+        let limits = wgpu::Limits { max_buffer_size: max, ..crate::gpu_caps::required_limits(&adapter.limits()) };
+        let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
+        let (device, queue) = pollster::block_on(adapter.request_device(&desc)).unwrap();
+        let caps = crate::gpu_caps::GpuCaps::of_adapter(&adapter, &device);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut r = Renderer::with_caps(&device, &queue, &caps);
+        // Distinct corners, so not indexed: just over the limit.
+        let corners = (max as usize / std::mem::size_of::<Vertex>() / 3 + 1) * 3;
+        let positions: Vec<Vec3> = (0..corners).map(|i| Vec3::new(i as f32, 0.0, 0.0)).collect();
+        let normals = vec![Vec3::Y; corners];
+        let first = r.set_mesh(&device, &queue, None, &positions, &normals, &[], &[]);
+        let meshes = r.meshes.len();
+        for _ in 0..3 {
+            assert_eq!(r.set_mesh(&device, &queue, Some(first), &positions, &normals, &[], &[]), first);
+        }
+        assert_eq!(r.meshes.len(), meshes);
+        assert_eq!(r.meshes[first as usize + BUILTIN_MESHES].count, 0);
+        assert!(pollster::block_on(scope.pop()).is_none());
     }
 
     use super::gpu_check::build_and_draw;
@@ -5856,6 +5892,18 @@ impl Renderer {
     ) -> u32 {
         self.mesh_gen += 1;
         let slot = index.map(|i| i as usize + BUILTIN_MESHES);
+        // A mesh too big for the GPU keeps the empty slot Mesh::upload gave
+        // it: re-adding it would push a new empty mesh (and a warning) every
+        // frame it is skinned on the CPU.
+        // shortcut: judged by its corner bytes, so a deformed copy whose
+        // indexed form would now fit stays empty; track the dropped size if
+        // that ever matters.
+        let corner_bytes = (positions.len() * std::mem::size_of::<Vertex>()) as u64;
+        if let (Some(i), Some(m)) = (index, slot.and_then(|s| self.meshes.get(s))) {
+            if m.count == 0 && corner_bytes > device.limits().max_buffer_size {
+                return i;
+            }
+        }
         match slot.and_then(|s| self.meshes.get(s)) {
             Some(m) if m.corners() as usize == positions.len() => {
                 let verts: Vec<Vertex> = positions
