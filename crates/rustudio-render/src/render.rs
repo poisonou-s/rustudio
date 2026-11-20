@@ -621,6 +621,29 @@ mod gpu_tests {
         build_and_draw(&instance, &adapter, Some(limits));
     }
 
+    /// A mesh over max_buffer_size uploads empty instead of panicking in
+    /// wgpu (a 3.2M-triangle mesh against 256 MiB, crash report 2026-11-21).
+    #[test]
+    fn oversized_mesh_uploads_empty() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter: oversized_mesh_uploads_empty skipped");
+            return;
+        };
+        let limits = wgpu::Limits { max_buffer_size: 1 << 16, ..wgpu::Limits::downlevel_defaults() };
+        let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
+        let (device, _queue) = pollster::block_on(adapter.request_device(&desc)).unwrap();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        // All distinct, so not indexed: 2048 * 64 bytes is twice the limit.
+        let verts: Vec<Vertex> = (0..2048)
+            .map(|i| Vertex { pos: [i as f32, 0.0, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], projection: [0.0; 4], color: [0.0; 4] })
+            .collect();
+        let big = Mesh::upload(&device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX, None);
+        let small = Mesh::upload(&device, "loaded mesh", &verts[..96], wgpu::BufferUsages::VERTEX, None);
+        assert!(pollster::block_on(scope.pop()).is_none());
+        assert_eq!((big.count, small.count), (0, 96));
+    }
+
     use super::gpu_check::build_and_draw;
 
 }
@@ -1276,8 +1299,21 @@ impl Mesh {
     }
 
     /// Uploads `verts` (a triangle list), indexed when that saves work.
+    /// A mesh whose buffer is over the device's max_buffer_size (a 3M
+    /// triangle mesh against wgpu's 256 MiB default) is logged and uploaded
+    /// empty, so it draws nothing: wgpu's validation error would panic.
     fn upload(device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Mesh {
-        let (vdata, ibuf, remap, count) = match Self::indexed(verts) {
+        let indexed = Self::indexed(verts);
+        let bytes = match &indexed {
+            Some((unique, index)) => std::mem::size_of_val(unique.as_slice()).max(std::mem::size_of_val(index.as_slice())),
+            None => std::mem::size_of_val(verts),
+        } as u64;
+        let max = device.limits().max_buffer_size;
+        if bytes > max {
+            log::warn!(target: "rustudio::gpu", "{label}: {} vertices need a {bytes}-byte buffer, over the GPU's {max}; not drawn", verts.len());
+            return Self::upload(device, label, &[], usage, cull);
+        }
+        let (vdata, ibuf, remap, count) = match indexed {
             Some((unique, index)) => {
                 let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(label),
